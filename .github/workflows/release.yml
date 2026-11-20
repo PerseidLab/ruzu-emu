@@ -1,4 +1,3 @@
-
 name: Build and Release
 
 on:
@@ -36,15 +35,17 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: ruzu-build-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
+
+  # ================================================
+  # LINUX APPIMAGE
+  # ================================================
+
   linux:
-    name: Build Linux AppImage
-    if: inputs.build_target == 'all' || inputs.build_target == 'linux'
+    name: Linux AppImage
     runs-on: ubuntu-24.04
+
+    if: inputs.build_target == 'all' || inputs.build_target == 'linux'
 
     steps:
       - name: Checkout
@@ -52,55 +53,46 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Linux dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y \
             build-essential \
-            ca-certificates \
             clang \
+            lld \
             cmake \
-            curl \
+            ninja-build \
+            pkg-config \
             git \
-            glslang-tools \
+            curl \
+            wget \
+            file \
+            patchelf \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
             libasound2-dev \
+            libudev-dev \
+            libpipewire-0.3-dev \
             libavcodec-dev \
             libavutil-dev \
             libswscale-dev \
-            libclang-dev \
-            libdbus-1-dev \
-            libdecor-0-dev \
-            libdrm-dev \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libgl1-mesa-dev \
-            libgtk-4-dev \
-            libjack-jackd2-dev \
-            libopus-dev \
-            libpipewire-0.3-dev \
-            libpulse-dev \
-            libssl-dev \
-            libudev-dev \
-            libvulkan-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxss-dev \
-            libxtst-dev \
-            ninja-build \
-            pkg-config \
-            vulkan-tools \
-            wayland-protocols \
-            python3 \
-            file \
-            binutils \
-            librsvg2-dev \
-            libgirepository1.0-dev
+            libopus-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-appimage
+          cache-targets: true
 
       - name: Verify FFmpeg dependencies
         run: |
@@ -108,44 +100,33 @@ jobs:
           pkg-config --modversion libavutil
           pkg-config --modversion libswscale
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-appimage
-
       - name: Build Linux AppImage
         run: |
-          chmod +x ./build.sh
+          chmod +x build.sh
           ./build.sh appimage --skip-deps
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: ruzu-linux
-          path: target/release/*.AppImage
+          path: |
+            target/release/*.AppImage
+            target/release/*.sha256
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+
+
+  # ================================================
+  # STEAM DECK APPIMAGE
+  # ================================================
 
   steamdeck:
-    name: Build Steam Deck AppImage
-    if: inputs.build_target == 'all' || inputs.build_target == 'steamdeck'
+    name: Steam Deck AppImage
     runs-on: ubuntu-24.04
 
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: false
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          swap-storage: false
+    if: inputs.build_target == 'all' || inputs.build_target == 'steamdeck'
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -154,37 +135,23 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            python3 \
-            python3-pip \
-            pkg-config \
-            libswscale-dev
-
-      - name: Verify Steam Deck Docker dependencies
-        run: |
-          # Ensure the Docker build image installs libswscale development files.
-          # This is idempotent if the package is already listed.
-          if ! grep -q 'libswscale-dev' scripts/steamdeck/Dockerfile; then
-            sed -i 's/libavutil-dev/libavutil-dev libswscale-dev/' \
-              scripts/steamdeck/Dockerfile
-          fi
-
-          grep -n 'libswscale-dev' scripts/steamdeck/Dockerfile
-
-      - name: Cache Steam Deck Cargo
-        uses: actions/cache@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          path: target/steamdeck/cargo
-          key: steamdeck-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            steamdeck-cargo-${{ runner.os }}-
+          python-version: "3.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: steamdeck
+          cache-targets: true
 
       - name: Build Steam Deck AppImage
         run: |
-          chmod +x ./build.sh
+          chmod +x build.sh
           ./build.sh steamdeck --jobs 2
 
       - name: Upload Steam Deck artifact
@@ -195,15 +162,25 @@ jobs:
             target/steamdeck/artifacts/*.AppImage
             target/steamdeck/artifacts/*.sha256
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+
+
+  # ================================================
+  # WINDOWS BUILD
+  # ================================================
 
   windows:
-    name: Build Windows
-    if: inputs.build_target == 'all' || inputs.build_target == 'windows'
+    name: Windows Build
     runs-on: windows-2022
+
+    if: inputs.build_target == 'all' || inputs.build_target == 'windows'
 
     env:
       RUZU_SETUP_ASSUME_YES: "1"
+
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\.vcpkg-cache,readwrite"
+
+      VCPKG_DOWNLOADS: "${{ github.workspace }}\\.vcpkg-downloads"
 
     steps:
       - name: Checkout
@@ -212,101 +189,165 @@ jobs:
           submodules: recursive
 
       - name: Install NSIS
-        run: choco install nsis --no-progress -y
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
+          arch: x64
 
-      - name: Cache Cargo
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create cache directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ".vcpkg-cache"
+          New-Item -ItemType Directory -Force -Path ".vcpkg-downloads"
+
+      # --------------------------------------------
+      # VCPKG BINARY CACHE
+      # --------------------------------------------
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-binary-${{ runner.os }}-${{ hashFiles('scripts/vcpkg-triplets/**', 'scripts/vcpkg-ports/**', 'scripts/build.ps1', '**/vcpkg.json', '**/vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-binary-${{ runner.os }}-
+
+      # --------------------------------------------
+      # VCPKG DOWNLOAD CACHE
+      # --------------------------------------------
+
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-downloads
+          key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('scripts/vcpkg-triplets/**', 'scripts/vcpkg-ports/**', 'scripts/build.ps1', '**/vcpkg.json', '**/vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-downloads-${{ runner.os }}-
+
+      # --------------------------------------------
+      # RUST CACHE
+      # --------------------------------------------
+
+      - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: windows-msvc
+          shared-key: windows
+          cache-targets: true
 
-      - name: Build Windows
+      # --------------------------------------------
+      # BUILD AND PACKAGE
+      # --------------------------------------------
+
+      - name: Build and package Windows
         shell: cmd
         run: |
-          call build.bat
-          if errorlevel 1 exit /b 1
+          call build.bat package
 
-      - name: Package Windows
-        shell: cmd
-        run: |
-          echo y| call build.bat package
-          if errorlevel 1 exit /b 1
+      # --------------------------------------------
+      # VERIFY PACKAGE OUTPUT
+      # --------------------------------------------
 
       - name: Verify Windows packages
         shell: pwsh
         run: |
-          $packageDir = "target/package"
+          $PackageDir = "target/package"
 
-          if (!(Test-Path $packageDir)) {
-            throw "Windows package directory was not created."
+          if (!(Test-Path $PackageDir)) {
+            throw "Package directory was not created: $PackageDir"
           }
 
-          $packages = Get-ChildItem $packageDir -File |
-            Where-Object {
-              $_.Extension -eq ".zip" -or
-              $_.Name -like "*-installer.exe"
-            }
+          $Files = Get-ChildItem $PackageDir -File -Recurse
 
-          if ($packages.Count -eq 0) {
-            throw "No Windows ZIP or installer was produced."
+          if ($Files.Count -eq 0) {
+            throw "No Windows package files were generated"
           }
 
-          New-Item -ItemType Directory -Force -Path "dist/release" | Out-Null
-
-          foreach ($package in $packages) {
-            Copy-Item $package.FullName "dist/release/"
-            Write-Host "Found package: $($package.Name)"
+          Write-Host "Windows package contents:"
+          $Files | ForEach-Object {
+            Write-Host $_.FullName
           }
+
+      # --------------------------------------------
+      # UPLOAD COMPLETE DIRECTORY
+      # --------------------------------------------
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: ruzu-windows
-          path: dist/release/*
+          path: target/package/
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+
+
+  # ================================================
+  # GITHUB RELEASE
+  # ================================================
 
   release:
-    name: Publish GitHub Release
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+
     needs:
       - linux
       - steamdeck
       - windows
 
-    if: >-
+    if: |
       always() &&
       !cancelled() &&
-      (inputs.build_target != 'linux' || needs.linux.result == 'success') &&
-      (inputs.build_target != 'steamdeck' || needs.steamdeck.result == 'success') &&
-      (inputs.build_target != 'windows' || needs.windows.result == 'success') &&
-      (
-        inputs.build_target == 'all' ||
-        inputs.build_target == 'linux' ||
-        inputs.build_target == 'steamdeck' ||
-        inputs.build_target == 'windows'
-      )
-
-    runs-on: ubuntu-24.04
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped') &&
+      (needs.steamdeck.result == 'success' || needs.steamdeck.result == 'skipped') &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
 
     steps:
-      - name: Download build artifacts
+
+      # --------------------------------------------
+      # DOWNLOAD LINUX
+      # --------------------------------------------
+
+      - name: Download Linux artifact
+        if: needs.linux.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          pattern: ruzu-*
-          path: release-assets
-          merge-multiple: true
+          name: ruzu-linux
+          path: release-assets/linux
 
-      - name: List release files
-        run: |
-          find release-assets -type f -maxdepth 3 -print
-          test -n "$(find release-assets -type f -print -quit)"
+      # --------------------------------------------
+      # DOWNLOAD STEAM DECK
+      # --------------------------------------------
+
+      - name: Download Steam Deck artifact
+        if: needs.steamdeck.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ruzu-steamdeck
+          path: release-assets/steamdeck
+
+      # --------------------------------------------
+      # DOWNLOAD WINDOWS
+      # --------------------------------------------
+
+      - name: Download Windows artifact
+        if: needs.windows.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ruzu-windows
+          path: release-assets/windows
+
+      # --------------------------------------------
+      # GENERATE RELEASE TAG
+      # --------------------------------------------
 
       - name: Generate release tag
-        id: release
+        id: release_tag
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
@@ -320,13 +361,16 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      - name: Publish GitHub Release
+      # --------------------------------------------
+      # CREATE RELEASE
+      # --------------------------------------------
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release.outputs.tag }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           name: ${{ inputs.release_name }}
-          target_commitish: ${{ github.sha }}
-          files: release-assets/**/*
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          make_latest: false
+          files: release-assets/**/*
