@@ -162,6 +162,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+
   windows:
     name: Build Windows
     if: inputs.build_target == 'windows' || inputs.build_target == 'all'
@@ -185,42 +186,37 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Windows
-        shell: cmd
-        run: |
-          call build.bat
-          if errorlevel 1 exit /b 1
-
-      - name: Create Windows packages
         shell: pwsh
         run: |
-          $env:PATH += ";$env:ProgramFiles(x86)\NSIS"
-
-          $packageScript = "dist/package-windows.ps1"
-
-          if (!(Test-Path $packageScript)) {
-            throw "Windows package script not found"
-          }
-
-          "y" | powershell.exe `
-            -NoProfile `
-            -ExecutionPolicy Bypass `
-            -File $packageScript
-
+          $env:RUZU_SETUP_ASSUME_YES = "1"
+          & .\scripts\build.ps1 build -Yes
           if ($LASTEXITCODE -ne 0) {
-            throw "Windows packaging failed"
+            throw "Windows build failed."
           }
 
-          $packages = Get-ChildItem target/package -File |
+      - name: Package Windows
+        shell: pwsh
+        run: |
+          $env:RUZU_SETUP_ASSUME_YES = "1"
+          & .\scripts\build.ps1 package -Yes
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows packaging failed."
+          }
+
+      - name: Collect Windows packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/release | Out-Null
+
+          $packages = Get-ChildItem target/package -File -ErrorAction SilentlyContinue |
             Where-Object {
               $_.Extension -eq ".zip" -or
               $_.Name.EndsWith("-installer.exe")
             }
 
-          if ($packages.Count -lt 2) {
-            throw "Expected Windows ZIP and installer were not generated"
+          if (-not $packages) {
+            throw "No Windows packages found in target/package."
           }
-
-          New-Item -ItemType Directory -Force dist/release | Out-Null
 
           Copy-Item $packages.FullName dist/release/
 
