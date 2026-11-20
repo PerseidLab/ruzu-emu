@@ -1,3 +1,4 @@
+
 name: Build and Release
 
 on:
@@ -35,17 +36,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ruzu-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-
-  # ================================================
-  # LINUX APPIMAGE
-  # ================================================
-
   linux:
-    name: Linux AppImage
-    runs-on: ubuntu-24.04
-
+    name: Build Linux AppImage
     if: inputs.build_target == 'all' || inputs.build_target == 'linux'
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -53,46 +52,55 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies
+      - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential \
+            ca-certificates \
             clang \
-            lld \
             cmake \
-            ninja-build \
-            pkg-config \
-            git \
             curl \
-            wget \
-            file \
-            patchelf \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            libssl-dev \
-            libvulkan-dev \
-            libx11-dev \
-            libxrandr-dev \
-            libxinerama-dev \
-            libxcursor-dev \
-            libxi-dev \
+            git \
+            glslang-tools \
             libasound2-dev \
-            libudev-dev \
-            libpipewire-0.3-dev \
             libavcodec-dev \
             libavutil-dev \
             libswscale-dev \
-            libopus-dev
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: linux-appimage
-          cache-targets: true
+            libclang-dev \
+            libdbus-1-dev \
+            libdecor-0-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgtk-4-dev \
+            libjack-jackd2-dev \
+            libopus-dev \
+            libpipewire-0.3-dev \
+            libpulse-dev \
+            libssl-dev \
+            libudev-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            ninja-build \
+            pkg-config \
+            vulkan-tools \
+            wayland-protocols \
+            python3 \
+            file \
+            binutils \
+            librsvg2-dev \
+            libgirepository1.0-dev
 
       - name: Verify FFmpeg dependencies
         run: |
@@ -100,33 +108,44 @@ jobs:
           pkg-config --modversion libavutil
           pkg-config --modversion libswscale
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-appimage
+
       - name: Build Linux AppImage
         run: |
-          chmod +x build.sh
+          chmod +x ./build.sh
           ./build.sh appimage --skip-deps
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: ruzu-linux
-          path: |
-            target/release/*.AppImage
-            target/release/*.sha256
+          path: target/release/*.AppImage
           if-no-files-found: error
-          compression-level: 0
-
-
-  # ================================================
-  # STEAM DECK APPIMAGE
-  # ================================================
+          retention-days: 7
 
   steamdeck:
-    name: Steam Deck AppImage
+    name: Build Steam Deck AppImage
+    if: inputs.build_target == 'all' || inputs.build_target == 'steamdeck'
     runs-on: ubuntu-24.04
 
-    if: inputs.build_target == 'all' || inputs.build_target == 'steamdeck'
-
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -135,23 +154,35 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 \
+            python3-pip \
+            pkg-config \
+            libswscale-dev
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify Steam Deck Docker dependencies
+        run: |
+          if ! grep -q 'libswscale-dev' scripts/steamdeck/Dockerfile; then
+            sed -i 's/libavutil-dev/libavutil-dev libswscale-dev/' \
+              scripts/steamdeck/Dockerfile
+          fi
 
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+          grep -n 'libswscale-dev' scripts/steamdeck/Dockerfile
+
+      - name: Cache Steam Deck Cargo
+        uses: actions/cache@v4
         with:
-          shared-key: steamdeck
-          cache-targets: true
+          path: target/steamdeck/cargo
+          key: steamdeck-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            steamdeck-cargo-${{ runner.os }}-
 
       - name: Build Steam Deck AppImage
         run: |
-          chmod +x build.sh
+          chmod +x ./build.sh
           ./build.sh steamdeck --jobs 2
 
       - name: Upload Steam Deck artifact
@@ -162,25 +193,15 @@ jobs:
             target/steamdeck/artifacts/*.AppImage
             target/steamdeck/artifacts/*.sha256
           if-no-files-found: error
-          compression-level: 0
-
-
-  # ================================================
-  # WINDOWS BUILD
-  # ================================================
+          retention-days: 7
 
   windows:
-    name: Windows Build
-    runs-on: windows-2022
-
+    name: Build Windows
     if: inputs.build_target == 'all' || inputs.build_target == 'windows'
+    runs-on: windows-2022
 
     env:
       RUZU_SETUP_ASSUME_YES: "1"
-
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\.vcpkg-cache,readwrite"
-
-      VCPKG_DOWNLOADS: "${{ github.workspace }}\\.vcpkg-downloads"
 
     steps:
       - name: Checkout
@@ -189,165 +210,198 @@ jobs:
           submodules: recursive
 
       - name: Install NSIS
-        shell: pwsh
-        run: |
-          choco install nsis -y --no-progress
+        run: choco install nsis --no-progress -y
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Setup Rust
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Create cache directories
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path ".vcpkg-cache"
-          New-Item -ItemType Directory -Force -Path ".vcpkg-downloads"
-
-      # --------------------------------------------
-      # VCPKG BINARY CACHE
-      # --------------------------------------------
-
-      - name: Cache vcpkg binary packages
-        uses: actions/cache@v4
         with:
-          path: .vcpkg-cache
-          key: vcpkg-binary-${{ runner.os }}-${{ hashFiles('scripts/vcpkg-triplets/**', 'scripts/vcpkg-ports/**', 'scripts/build.ps1', '**/vcpkg.json', '**/vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-binary-${{ runner.os }}-
+          toolchain: stable-x86_64-pc-windows-msvc
 
-      # --------------------------------------------
-      # VCPKG DOWNLOAD CACHE
-      # --------------------------------------------
-
-      - name: Cache vcpkg downloads
-        uses: actions/cache@v4
-        with:
-          path: .vcpkg-downloads
-          key: vcpkg-downloads-${{ runner.os }}-${{ hashFiles('scripts/vcpkg-triplets/**', 'scripts/vcpkg-ports/**', 'scripts/build.ps1', '**/vcpkg.json', '**/vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-downloads-${{ runner.os }}-
-
-      # --------------------------------------------
-      # RUST CACHE
-      # --------------------------------------------
-
-      - name: Cache Rust
+      - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows
-          cache-targets: true
+          key: windows-msvc
 
-      # --------------------------------------------
-      # BUILD AND PACKAGE
-      # --------------------------------------------
-
-      - name: Build and package Windows
+      - name: Build Windows
         shell: cmd
         run: |
-          call build.bat package
+          call build.bat
+          if errorlevel 1 exit /b 1
 
-      # --------------------------------------------
-      # VERIFY PACKAGE OUTPUT
-      # --------------------------------------------
+      - name: Package Windows
+        shell: cmd
+        run: |
+          echo y| call build.bat package
+          if errorlevel 1 exit /b 1
 
-      - name: Verify Windows packages
+      # Rebuild the ZIP with clean relative paths.
+      - name: Fix and verify Windows ZIP
         shell: pwsh
         run: |
-          $PackageDir = "target/package"
+          $ErrorActionPreference = "Stop"
 
-          if (!(Test-Path $PackageDir)) {
-            throw "Package directory was not created: $PackageDir"
+          $packageDir = Join-Path $PWD "target/package"
+
+          if (!(Test-Path -LiteralPath $packageDir -PathType Container)) {
+            throw "Windows package directory was not created."
           }
 
-          $Files = Get-ChildItem $PackageDir -File -Recurse
+          # Find the staged standalone application directory.
+          $stageDirs = @(
+            Get-ChildItem -LiteralPath $packageDir -Directory |
+              Where-Object { $_.Name -like "Ruzu-Windows-*" } |
+              Sort-Object LastWriteTime -Descending
+          )
 
-          if ($Files.Count -eq 0) {
-            throw "No Windows package files were generated"
+          if ($stageDirs.Count -eq 0) {
+            throw "No staged Ruzu Windows package directory was found."
           }
 
-          Write-Host "Windows package contents:"
-          $Files | ForEach-Object {
-            Write-Host $_.FullName
+          $stage = $stageDirs[0]
+          $packageName = $stage.Name
+
+          Write-Host "Staged directory: $($stage.FullName)"
+
+          # Verify the staged application before archiving.
+          foreach ($requiredFile in @(
+            "ruzu.exe",
+            "ruzu-cmd.exe",
+            "LICENSE.txt",
+            "README.md"
+          )) {
+            $requiredPath = Join-Path $stage.FullName $requiredFile
+
+            if (!(Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required package file is missing: $requiredFile"
+            }
           }
 
-      # --------------------------------------------
-      # UPLOAD COMPLETE DIRECTORY
-      # --------------------------------------------
+          # Recreate the ZIP using paths relative to the staged directory.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zipPath = Join-Path $packageDir "$packageName.zip"
+
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $stage.FullName,
+            $zipPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $true
+          )
+
+          if (!(Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "Failed to create the corrected Windows ZIP."
+          }
+
+          # Inspect ZIP entries to ensure they have normal relative paths.
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+
+          try {
+            $entries = @($archive.Entries | ForEach-Object {
+              $_.FullName
+            })
+
+            if ($entries.Count -eq 0) {
+              throw "The Windows ZIP is empty."
+            }
+
+            if ($entries | Where-Object {
+              $_ -match '^[A-Za-z]:' -or $_ -match '\\'
+            }) {
+              throw "The ZIP contains absolute paths or backslash separators."
+            }
+
+            if (!($entries -contains "$packageName/ruzu.exe")) {
+              throw "The ZIP does not contain the expected root folder and ruzu.exe."
+            }
+
+            if (!($entries -contains "$packageName/ruzu-cmd.exe")) {
+              throw "The ZIP does not contain ruzu-cmd.exe."
+            }
+
+            Write-Host "Verified ZIP entries:"
+            $entries | Select-Object -First 30 | ForEach-Object {
+              Write-Host "  $_"
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+
+          # Verify the NSIS installer.
+          $installerPath = Join-Path $packageDir "$packageName-installer.exe"
+
+          if (!(Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "Windows NSIS installer was not generated: $installerPath"
+          }
+
+          # Upload only the two distributable files.
+          $releaseDir = Join-Path $PWD "dist/release"
+
+          if (Test-Path -LiteralPath $releaseDir) {
+            Remove-Item -LiteralPath $releaseDir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+          Copy-Item -LiteralPath $zipPath -Destination $releaseDir
+          Copy-Item -LiteralPath $installerPath -Destination $releaseDir
+
+          Write-Host ""
+          Write-Host "Final Windows release files:"
+          Get-ChildItem -LiteralPath $releaseDir -File |
+            ForEach-Object {
+              Write-Host "  $($_.Name) ($($_.Length) bytes)"
+            }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: ruzu-windows
-          path: target/package/
+          path: dist/release/
           if-no-files-found: error
-          compression-level: 0
-
-
-  # ================================================
-  # GITHUB RELEASE
-  # ================================================
+          retention-days: 7
 
   release:
-    name: Create GitHub Release
-    runs-on: ubuntu-24.04
-
+    name: Publish GitHub Release
     needs:
       - linux
       - steamdeck
       - windows
 
-    if: |
+    if: >-
       always() &&
       !cancelled() &&
-      (needs.linux.result == 'success' || needs.linux.result == 'skipped') &&
-      (needs.steamdeck.result == 'success' || needs.steamdeck.result == 'skipped') &&
-      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+      (inputs.build_target != 'linux' || needs.linux.result == 'success') &&
+      (inputs.build_target != 'steamdeck' || needs.steamdeck.result == 'success') &&
+      (inputs.build_target != 'windows' || needs.windows.result == 'success') &&
+      (
+        inputs.build_target == 'all' ||
+        inputs.build_target == 'linux' ||
+        inputs.build_target == 'steamdeck' ||
+        inputs.build_target == 'windows'
+      )
+
+    runs-on: ubuntu-24.04
 
     steps:
-
-      # --------------------------------------------
-      # DOWNLOAD LINUX
-      # --------------------------------------------
-
-      - name: Download Linux artifact
-        if: needs.linux.result == 'success'
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ruzu-linux
-          path: release-assets/linux
+          pattern: ruzu-*
+          path: release-assets
+          merge-multiple: true
 
-      # --------------------------------------------
-      # DOWNLOAD STEAM DECK
-      # --------------------------------------------
-
-      - name: Download Steam Deck artifact
-        if: needs.steamdeck.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: ruzu-steamdeck
-          path: release-assets/steamdeck
-
-      # --------------------------------------------
-      # DOWNLOAD WINDOWS
-      # --------------------------------------------
-
-      - name: Download Windows artifact
-        if: needs.windows.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: ruzu-windows
-          path: release-assets/windows
-
-      # --------------------------------------------
-      # GENERATE RELEASE TAG
-      # --------------------------------------------
+      - name: List release files
+        run: |
+          find release-assets -maxdepth 3 -type f -print
+          test -n "$(find release-assets -type f -print -quit)"
 
       - name: Generate release tag
-        id: release_tag
+        id: release
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
@@ -361,16 +415,13 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      # --------------------------------------------
-      # CREATE RELEASE
-      # --------------------------------------------
-
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
+          tag_name: ${{ steps.release.outputs.tag }}
           name: ${{ inputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          files: release-assets/**/*
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
-          make_latest: false
-          files: release-assets/**/*
+          fail_on_unmatched_files: true
