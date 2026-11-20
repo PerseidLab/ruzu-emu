@@ -3,19 +3,32 @@ name: Build and Release
 on:
   workflow_dispatch:
     inputs:
+      build_target:
+        description: "Select which platform to build"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - steamdeck
+          - windows
+
       release_tag:
-        description: "Release tag (leave empty for automatic CI version)"
+        description: "Release tag (empty = automatic CI tag)"
         required: false
         type: string
         default: ""
+
       release_name:
         description: "Release name"
-        required: false
+        required: true
         type: string
         default: "Ruzu CI Build"
+
       prerelease:
         description: "Mark release as prerelease"
-        required: false
+        required: true
         type: boolean
         default: true
 
@@ -23,12 +36,14 @@ permissions:
   contents: write
 
 jobs:
+
   linux:
     name: Build Linux AppImage
+    if: inputs.build_target == 'linux' || inputs.build_target == 'all'
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -74,8 +89,6 @@ jobs:
             libxtst-dev \
             ninja-build \
             pkg-config \
-            vulkan-tools \
-            wayland-protocols \
             python3 \
             file \
             binutils \
@@ -93,23 +106,75 @@ jobs:
           chmod +x build.sh
           ./build.sh appimage --skip-deps
 
-      - name: Upload Linux package
+      - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ruzu-linux-x86_64
+          name: ruzu-linux
           path: target/release/*.AppImage
           if-no-files-found: error
           retention-days: 7
 
-  windows:
-    name: Build Windows ZIP
-    runs-on: windows-2022
+  steamdeck:
+    name: Build Steam Deck AppImage
+    if: inputs.build_target == 'steamdeck' || inputs.build_target == 'all'
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout source
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/share/boost
+          df -h
+
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target/steamdeck/cargo
+
+      - name: Build Steam Deck AppImage
+        run: |
+          chmod +x build.sh
+          ./build.sh steamdeck --jobs 2
+
+      - name: Upload Steam Deck artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruzu-steamdeck
+          path: |
+            target/steamdeck/artifacts/*.AppImage
+            target/steamdeck/artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Build Windows
+    if: inputs.build_target == 'windows' || inputs.build_target == 'all'
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install NSIS
+        run: choco install nsis -y
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -121,55 +186,97 @@ jobs:
 
       - name: Build Windows
         shell: cmd
-        env:
-          RUZU_SETUP_ASSUME_YES: "1"
         run: |
           call build.bat
           if errorlevel 1 exit /b 1
 
-      - name: Package Windows ZIP
+      - name: Create Windows packages
         shell: pwsh
         run: |
-          $source = "build/x86_64-pc-windows-msvc/release"
+          $env:PATH += ";$env:ProgramFiles(x86)\NSIS"
 
-          if (!(Test-Path "$source/ruzu.exe")) {
-            throw "Ruzu executable not found"
+          $packageScript = "dist/package-windows.ps1"
+
+          if (!(Test-Path $packageScript)) {
+            throw "Windows package script not found"
           }
 
-          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          "y" | powershell.exe `
+            -NoProfile `
+            -ExecutionPolicy Bypass `
+            -File $packageScript
 
-          Compress-Archive `
-            -Path "$source/*" `
-            -DestinationPath "dist/release/Ruzu-Windows-x64.zip" `
-            -CompressionLevel Optimal
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows packaging failed"
+          }
 
-      - name: Upload Windows package
+          $packages = Get-ChildItem target/package -File |
+            Where-Object {
+              $_.Extension -eq ".zip" -or
+              $_.Name.EndsWith("-installer.exe")
+            }
+
+          if ($packages.Count -lt 2) {
+            throw "Expected Windows ZIP and installer were not generated"
+          }
+
+          New-Item -ItemType Directory -Force dist/release | Out-Null
+
+          Copy-Item $packages.FullName dist/release/
+
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ruzu-windows-x86_64
-          path: dist/release/Ruzu-Windows-x64.zip
+          name: ruzu-windows
+          path: dist/release/*
           if-no-files-found: error
           retention-days: 7
 
   release:
-    name: Create GitHub Release
-    runs-on: ubuntu-24.04
+    name: Publish GitHub Release
     needs:
       - linux
+      - steamdeck
       - windows
 
-    steps:
-      - name: Download Linux package
-        uses: actions/download-artifact@v4
-        with:
-          name: ruzu-linux-x86_64
-          path: release
+    if: |
+      always() &&
+      !cancelled() &&
+      (
+        (inputs.build_target == 'linux' && needs.linux.result == 'success') ||
+        (inputs.build_target == 'steamdeck' && needs.steamdeck.result == 'success') ||
+        (inputs.build_target == 'windows' && needs.windows.result == 'success') ||
+        (
+          inputs.build_target == 'all' &&
+          needs.linux.result == 'success' &&
+          needs.steamdeck.result == 'success' &&
+          needs.windows.result == 'success'
+        )
+      )
 
-      - name: Download Windows package
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download Linux
+        if: inputs.build_target == 'linux' || inputs.build_target == 'all'
         uses: actions/download-artifact@v4
         with:
-          name: ruzu-windows-x86_64
-          path: release
+          name: ruzu-linux
+          path: release/linux
+
+      - name: Download Steam Deck
+        if: inputs.build_target == 'steamdeck' || inputs.build_target == 'all'
+        uses: actions/download-artifact@v4
+        with:
+          name: ruzu-steamdeck
+          path: release/steamdeck
+
+      - name: Download Windows
+        if: inputs.build_target == 'windows' || inputs.build_target == 'all'
+        uses: actions/download-artifact@v4
+        with:
+          name: ruzu-windows
+          path: release/windows
 
       - name: Generate release tag
         id: tag
@@ -187,7 +294,7 @@ jobs:
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
@@ -196,7 +303,8 @@ jobs:
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
           files: |
-            release/*.AppImage
-            release/*.zip
+            release/linux/*
+            release/steamdeck/*
+            release/windows/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
