@@ -1,3 +1,4 @@
+
 name: Build and Release
 
 on:
@@ -35,11 +36,14 @@ on:
 permissions:
   contents: write
 
-jobs:
+concurrency:
+  group: ruzu-build-${{ github.ref }}
+  cancel-in-progress: false
 
+jobs:
   linux:
     name: Build Linux AppImage
-    if: inputs.build_target == 'linux' || inputs.build_target == 'all'
+    if: inputs.build_target == 'all' || inputs.build_target == 'linux'
     runs-on: ubuntu-24.04
 
     steps:
@@ -48,10 +52,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies
+      - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential \
             ca-certificates \
             clang \
@@ -62,6 +66,7 @@ jobs:
             libasound2-dev \
             libavcodec-dev \
             libavutil-dev \
+            libswscale-dev \
             libclang-dev \
             libdbus-1-dev \
             libdecor-0-dev \
@@ -89,21 +94,31 @@ jobs:
             libxtst-dev \
             ninja-build \
             pkg-config \
+            vulkan-tools \
+            wayland-protocols \
             python3 \
             file \
             binutils \
             librsvg2-dev \
             libgirepository1.0-dev
 
+      - name: Verify FFmpeg dependencies
+        run: |
+          pkg-config --modversion libavcodec
+          pkg-config --modversion libavutil
+          pkg-config --modversion libswscale
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-appimage
 
       - name: Build Linux AppImage
         run: |
-          chmod +x build.sh
+          chmod +x ./build.sh
           ./build.sh appimage --skip-deps
 
       - name: Upload Linux artifact
@@ -116,40 +131,60 @@ jobs:
 
   steamdeck:
     name: Build Steam Deck AppImage
-    if: inputs.build_target == 'steamdeck' || inputs.build_target == 'all'
+    if: inputs.build_target == 'all' || inputs.build_target == 'steamdeck'
     runs-on: ubuntu-24.04
 
     steps:
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/share/boost
-          df -h
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up Docker
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Install dependencies
+      - name: Install host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3
+          sudo apt-get install -y --no-install-recommends \
+            python3 \
+            python3-pip \
+            pkg-config \
+            libswscale-dev
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Verify Steam Deck Docker dependencies
+        run: |
+          # Ensure the Docker build image installs libswscale development files.
+          # This is idempotent if the package is already listed.
+          if ! grep -q 'libswscale-dev' scripts/steamdeck/Dockerfile; then
+            sed -i 's/libavutil-dev/libavutil-dev libswscale-dev/' \
+              scripts/steamdeck/Dockerfile
+          fi
+
+          grep -n 'libswscale-dev' scripts/steamdeck/Dockerfile
+
+      - name: Cache Steam Deck Cargo
+        uses: actions/cache@v4
         with:
-          workspaces: |
-            . -> target/steamdeck/cargo
+          path: target/steamdeck/cargo
+          key: steamdeck-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            steamdeck-cargo-${{ runner.os }}-
 
       - name: Build Steam Deck AppImage
         run: |
-          chmod +x build.sh
+          chmod +x ./build.sh
           ./build.sh steamdeck --jobs 2
 
       - name: Upload Steam Deck artifact
@@ -162,11 +197,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-
   windows:
     name: Build Windows
-    if: inputs.build_target == 'windows' || inputs.build_target == 'all'
+    if: inputs.build_target == 'all' || inputs.build_target == 'windows'
     runs-on: windows-2022
+
+    env:
+      RUZU_SETUP_ASSUME_YES: "1"
 
     steps:
       - name: Checkout
@@ -175,7 +212,7 @@ jobs:
           submodules: recursive
 
       - name: Install NSIS
-        run: choco install nsis -y
+        run: choco install nsis --no-progress -y
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -184,41 +221,46 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
 
       - name: Build Windows
-        shell: pwsh
+        shell: cmd
         run: |
-          $env:RUZU_SETUP_ASSUME_YES = "1"
-          & .\scripts\build.ps1 build -Yes
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows build failed."
-          }
+          call build.bat
+          if errorlevel 1 exit /b 1
 
       - name: Package Windows
+        shell: cmd
+        run: |
+          echo y| call build.bat package
+          if errorlevel 1 exit /b 1
+
+      - name: Verify Windows packages
         shell: pwsh
         run: |
-          $env:RUZU_SETUP_ASSUME_YES = "1"
-          & .\scripts\build.ps1 package -Yes
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows packaging failed."
+          $packageDir = "target/package"
+
+          if (!(Test-Path $packageDir)) {
+            throw "Windows package directory was not created."
           }
 
-      - name: Collect Windows packages
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/release | Out-Null
-
-          $packages = Get-ChildItem target/package -File -ErrorAction SilentlyContinue |
+          $packages = Get-ChildItem $packageDir -File |
             Where-Object {
               $_.Extension -eq ".zip" -or
-              $_.Name.EndsWith("-installer.exe")
+              $_.Name -like "*-installer.exe"
             }
 
-          if (-not $packages) {
-            throw "No Windows packages found in target/package."
+          if ($packages.Count -eq 0) {
+            throw "No Windows ZIP or installer was produced."
           }
 
-          Copy-Item $packages.FullName dist/release/
+          New-Item -ItemType Directory -Force -Path "dist/release" | Out-Null
+
+          foreach ($package in $packages) {
+            Copy-Item $package.FullName "dist/release/"
+            Write-Host "Found package: $($package.Name)"
+          }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -235,72 +277,56 @@ jobs:
       - steamdeck
       - windows
 
-    if: |
+    if: >-
       always() &&
       !cancelled() &&
+      (inputs.build_target != 'linux' || needs.linux.result == 'success') &&
+      (inputs.build_target != 'steamdeck' || needs.steamdeck.result == 'success') &&
+      (inputs.build_target != 'windows' || needs.windows.result == 'success') &&
       (
-        (inputs.build_target == 'linux' && needs.linux.result == 'success') ||
-        (inputs.build_target == 'steamdeck' && needs.steamdeck.result == 'success') ||
-        (inputs.build_target == 'windows' && needs.windows.result == 'success') ||
-        (
-          inputs.build_target == 'all' &&
-          needs.linux.result == 'success' &&
-          needs.steamdeck.result == 'success' &&
-          needs.windows.result == 'success'
-        )
+        inputs.build_target == 'all' ||
+        inputs.build_target == 'linux' ||
+        inputs.build_target == 'steamdeck' ||
+        inputs.build_target == 'windows'
       )
 
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Download Linux
-        if: inputs.build_target == 'linux' || inputs.build_target == 'all'
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ruzu-linux
-          path: release/linux
+          pattern: ruzu-*
+          path: release-assets
+          merge-multiple: true
 
-      - name: Download Steam Deck
-        if: inputs.build_target == 'steamdeck' || inputs.build_target == 'all'
-        uses: actions/download-artifact@v4
-        with:
-          name: ruzu-steamdeck
-          path: release/steamdeck
-
-      - name: Download Windows
-        if: inputs.build_target == 'windows' || inputs.build_target == 'all'
-        uses: actions/download-artifact@v4
-        with:
-          name: ruzu-windows
-          path: release/windows
+      - name: List release files
+        run: |
+          find release-assets -type f -maxdepth 3 -print
+          test -n "$(find release-assets -type f -print -quit)"
 
       - name: Generate release tag
-        id: tag
+        id: release
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
-          RUN_NUMBER: ${{ github.run_number }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
           else
-            TAG="ci-$(date -u +%Y%m%d)-${RUN_NUMBER}-${RUN_ATTEMPT}"
+            TAG="ci-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          tag_name: ${{ steps.release.outputs.tag }}
           name: ${{ inputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          files: release-assets/**/*
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
-          files: |
-            release/linux/*
-            release/steamdeck/*
-            release/windows/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: true
