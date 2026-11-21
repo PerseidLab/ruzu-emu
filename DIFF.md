@@ -1,5 +1,189 @@
 # Upstream parity notes
 
+## 2026-11-20 — precompiled pipelines: used-list boot gating and background preparation (PR 26, issue #24): video_core/{renderer_vulkan/{pipeline_cache,graphics_pipeline},shader_notify}.rs, ruzu/{boot,main_window,status_bar}.rs vs Lichii video_core/renderer_vulkan/{vk_pipeline_cache.cpp,vk_pipeline_cache_records.{h,cpp},vk_graphics_pipeline.h} and Fritchii (not available here)
+
+Upstream references:
+- **Lichii** (`~/Dev/emulators/lichii`, this repository's reference), checked
+  2026-11-20: it has the used-list boot gating (`vulkan_used.bin` "EUP1" format,
+  `LoadUsedPipelines`, `MarkUsed`/`WasUsed`, `SaveUsedPipelines`,
+  `MaxPipelinesWithoutUsedList`, `disk_pipelines`), now stored as per-session
+  `Used` records in its shader cache v2 log. It has **no**
+  `StartPrecompiled`/`PreparePrecompiled` build-and-drop thread, **no**
+  `WarmProgress`/`WarmMayBuild`/precompile state in `ShaderNotify`
+  (`shader_notify.h` is still Eden's), and no "warm" status. Its background
+  step for skipped records is `ScheduledPrebuild`
+  (`vk_pipeline_cache_prebuild.h`), which keeps what it builds; its precache
+  "warm" is `shader_warm/` (Switch 2 game-file archives, a `.done` marker with
+  size, write time, driver, device and cache version).
+- **Fritchii** (`/Users/mojics/orca/Fritchii`, the contributor's checkout,
+  Eden-lineage fork cited in https://github.com/vricosti/ruzu-emu/issues/24):
+  commits `be76402ab5` (`vulkan_used.bin` boot gating, also in Lichii) and
+  `790bca8969` / `4a4fa51576` (`StartPrecompiled`/`PreparePrecompiled`,
+  `shader_notify` warm/precompile state). The last two are absent from Lichii
+  and from this machine: the background preparation, the stamp file and the
+  `ShaderNotify` warm/precompile state keep the PR's form and **could not be
+  verified against their source here**.
+
+### Intentional differences
+- **NVN2 recipe, assembler and game-file extractor not ported yet**
+  (`nx2_recipe.*`, `nx2_shader_extract.*`, `tools/nx2-precompile`; Lichii's
+  counterpart is `shader_warm/`). Those scan BNSH/BAHS/NDSR **Switch 2** shader
+  archives. ruzu now runs Switch 2 titles experimentally, so they are a missing
+  item, not dead code. The ported runtime reads ruzu's own `vulkan.bin`
+  instead: self-contained `GenericEnvironment`s plus keys, already versioned by
+  `CACHE_VERSION`.
+- **Preparation input is the disk cache**, not an `NX2PREP1` file. Boot captures
+  the byte range of every graphics record the used-list gating skipped, and the
+  preparation re-reads exactly those ranges. Fritchii can stream its immutable
+  precompiled file; ruzu must not, because the GPU thread keeps appending to
+  `vulkan.bin`.
+- **Environment names** `RUZU_PRELOAD_ALL_PIPELINES` / `RUZU_DISABLE_PRECOMPILE`
+  and `RUZU_WARM_WHILE_PLAYING` replace `EDEN_NX2_PRELOAD_ALL_PIPELINES`,
+  `EDEN_NX2_PRECOMPILE` and `EDEN_NX2_WARM_WHILE_PLAYING`. There is no numeric
+  Mode(): preparation is on by default because it only rebuilds pipelines the
+  user's own cache already holds, and the override env var turns it off.
+- **Stamp by prepared extent, not by file size and time** (review,
+  2026-11-20). Fritchii stamps its immutable precompiled file by size and
+  modification time (as described by the PR, not verified here), and the PR
+  stamped `vulkan.bin` the same way. `vulkan.bin` grows whenever a session meets
+  a new pipeline, so that stamp failed on the next boot and every skipped record
+  was prepared again, session after session. The stamp now holds
+  `prepared_end fingerprint driver_version build_rev model`: every record before
+  `prepared_end` was built by this driver and build (at boot or by a
+  preparation), and the next preparation takes only the records past it. The
+  fingerprint (FNV-1a of the first 64 KiB) and the file reaching `prepared_end`
+  tell an appended file from one recreated under the same name. A stopped
+  preparation stamps the records it reached (they are prepared in file order),
+  which replaces Fritchii's separate progress file (`precompiled_progress.*`,
+  not ported). "Prepare Shaders Now" still prepares every skipped record. The
+  stamp is written through a temporary file and a rename.
+  `common::scm_rev::SCM_REV` stands for `Common::g_scm_rev`.
+- `save_used_pipelines` logs a debug line with the session count. Upstream has
+  no logging here; the line records the minimum-used gate for field diagnosis.
+- `PipelineCache::drop` sets the preparation cancel flag and joins the
+  preparation thread **before** the final driver-cache serialization. Fritchii's
+  `std::jthread` member is destroyed after the destructor body, so its thread can
+  still be building while the cache is written. Joining first keeps the
+  serialization free of concurrent builders.
+- `ShaderNotify` keeps ruzu's `Mutex<ReportState>` for the completion timeout.
+  The new warm/precompile atomics follow upstream exactly, including
+  `RequestPrecompile` only moving Idle to Asked.
+- **One usage-tracking mechanism** (review, 2026-11-20). The earlier ruzu
+  sidecar `vulkan.lru` (`pipeline_lru`, `RZLR`, per-draw `note_pipeline_use`
+  with a use clock) and the key set `disk_graphics_keys` are removed; the used
+  list `vulkan_used.bin` (sessions since last use, Lichii
+  `vk_pipeline_cache_records.h:18-23`) and `disk_pipelines` (key hashes,
+  Lichii `vk_pipeline_cache.h:314-319`) are the only ones left. Session ages
+  are kept rather than the use clock because they are what Lichii keeps and
+  what the boot gating needs (built at boot = named by one of the last N
+  sessions); a clock only orders keys inside one list.
+- Use is recorded the Lichii way: `GraphicsPipeline::mark_used`/`was_used`
+  (Lichii `MarkUsed`/`WasUsed`, `vk_graphics_pipeline.h:268-282`, without the
+  frame number that only serves Lichii's eviction), set in
+  `current_graphics_pipeline_slow_path` the first time a pipeline is handed
+  out (Lichii `vk_pipeline_cache.cpp:2114-2123`). `save_used_pipelines` walks
+  `graphics_cache` for marked pipelines (Lichii `SaveUsedPipelines`,
+  `vk_pipeline_cache.cpp:897-917`). The lookup fast path no longer records
+  anything: transitions are only added by the slow path, to pipelines it
+  already returned and marked. Lichii's own `used_this_session` pointer set is
+  replaced by the mark plus a counter, so no lookup inserts into a hash set.
+- `RUZU_PIPELINE_BOOT_LIMIT` (ruzu extension) keeps working on top of the used
+  gating: when set, the remaining boot set is ranked by the used list's age
+  (unlisted keys first to go) instead of the removed use clock, and the
+  graphics records it defers join the background preparation.
+- The graphics duplicate-append guard is `disk_pipelines` (u64 key hashes, as
+  Lichii `vk_pipeline_cache.cpp:2998-3003`) instead of a set of full keys; it is
+  filled before the `RUZU_SKIP_BOOT_PRECOMPILE` early return, as the key sets
+  were.
+- **Current Lichii boot gating** (review, 2026-11-20), replacing the Fritchii
+  values the port started from: sessions kept `USED_PIPELINES_MAX_AGE` = 16, 8 on
+  MoltenVK (Lichii `UsedPipelinesMaxAge`/`MaxUsedPipelineAge`,
+  `vk_pipeline_cache.cpp:794-810`); without a used list only the first
+  `MAX_PIPELINES_WITHOUT_USED_LIST` = 3000 graphics records are built at boot
+  instead of all of them (`vk_pipeline_cache.cpp:811-817`, `1428-1476`); a
+  later record of a key already seen is neither built nor prepared
+  (`vk_pipeline_cache.cpp:1467-1470`); a used list is read without entries at
+  or past the age limit (`LoadUsedPipelines`,
+  `vk_pipeline_cache_records.cpp:13-33`); the used list is saved at most every
+  15 s instead of 120 s (`vk_pipeline_cache.cpp:2114`).
+- **Not ported from current Lichii** (each a large slice of its own):
+  - the shader cache v2 log (`vk_shader_cache_v2.*`): one append-only log holding
+    programs, pipelines, tombstones and one `Used` record per session, with
+    `UsedPipelinesFromLog`/`RelinkUsedPipelines` (`vk_shader_cache_v2.cpp:324-386`)
+    deriving the ages and expiring sessions. ruzu keeps the single
+    `vulkan_used.bin` file, whose `{hash, age}` content is what Lichii itself
+    migrates from (`vk_shader_cache_v2.cpp:125-142`);
+  - the pipeline eviction (`EvictUnusedPipelines`, `KeptPipelines`,
+    `used_and_evicted`), so `MarkUsed` keeps no frame number here and
+    `SaveUsedPipelines` has no evicted set to add;
+  - `build_all_cached_shaders` and its spare-room boot builds;
+  - `ScheduledPrebuild` (`vk_pipeline_cache_prebuild.h`): Lichii's own background
+    step builds skipped records as Background jobs of its shader job scheduler
+    and **keeps** them (up to `PrebuildLimit`) until a draw takes one. The
+    Fritchii build-and-drop preparation of this port is a different mechanism
+    (see above).
+
+### Unintentional differences
+- The PR described a fix of `load_disk_resources` skipping an entry without
+  consuming its key. Both callbacks already read the key first, before any early
+  return, on the PR's base and on `main` (`load_compute` and `load_graphics`);
+  the PR only adds the record-range bookkeeping after that read. No such fix is
+  part of this change. `captured_graphics_records_read_back_bounded` covers the
+  bounded re-read of a captured record.
+- Review fixes (2026-11-20): `write_used_pipelines` used `age + 1` on a byte read
+  from the file (overflow on 255; now `saturating_add`, and the reader drops
+  ages at or past the limit as Lichii's does); it wrote the list in place with
+  one syscall per field (now built in memory, written to `vulkan_used.bin.tmp`,
+  synced and renamed over the list, on the serialization thread).
+- Review fixes, `VkPrecompile` thread (2026-11-20):
+  - stopping it: `stop_precompiled` sets the cancel flag **before** dropping
+    the worker. `start_precompiled` used to drop a previous worker first and only
+    then clear the flag, which joins a thread whose loop ends only on that flag
+    (or `stop_loading`, never set by `ruzu-cmd`): a second load would hang.
+    Each run now has its own flag, and `load_disk_resources` stops a running
+    preparation before it replaces the driver cache handle it builds into;
+  - each captured record carries the key hash boot read, and the re-read
+    rejects a record of the right length holding another key (a `vulkan.bin`
+    replaced under the same name; an unlinked one stays readable through the
+    open handle on Unix);
+  - the preparation's builds report to a `ShaderNotify` of their own. Through
+    the GPU's, every build counted as a game shader ("Building: 1 shader", held
+    2 s after each), so the status bar never showed "Preparing: n/m".
+- Thread-safety review of the preparation (what was checked, 2026-11-20):
+  `vkCreateGraphicsPipelines` on the shared `VkPipelineCache` is internally
+  synchronized (the cache is created without
+  `VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`), as the boot workers
+  and the serialization thread's `vkGetPipelineCacheData` already rely on; the
+  handle is serialized and destroyed in `Drop` only after the thread is joined.
+  Unlike the boot workers, this thread builds `GraphicsPipeline` objects while
+  the GPU thread runs: the shared state it touches is the descriptor pool
+  (`banks_mutex` + per-bank mutex), the render-pass cache (mutex), the
+  scheduler's master semaphore `Arc` and two fields of the descriptor-buffer
+  ring that are only written at construction. Rust-wise these are shared reads
+  through raw pointers the GPU thread may hold `&mut` to; no field read is
+  written after construction. The warm gate (`warm_may_build`,
+  `set_emulation_paused`, `set_warm_requested`, `RUZU_WARM_WHILE_PLAYING`) is
+  ported but nothing calls it: the preparation runs while the game runs, at
+  low priority, as the PR describes.
+
+### Missing items
+- "Prepare Shaders Now" has no GUI menu action yet: `PipelineCache::request_precompile`
+  and the `ShaderNotify` request loop are ported and unit-tested, and the status
+  bar shows the preparation, but no menu item invokes them.
+- `ruzu-cmd` does not display warm progress; it logs it only.
+
+### Binary layout verification
+- PASS: `vulkan_used.bin` = `u32 "EUP1" (0x31505545)`, `u32 count`, then
+  `{ u64 key hash, u8 sessions-since-use }`, little-endian, exactly
+  Fritchii's `SaveUsedPipelines` layout. Round-trip and aging (drop at
+  `age + 1 >= 8`) are covered by `used_pipelines_round_trip_matches_fritchii_layout`
+  and `used_pipelines_age_and_drop_after_max_age`.
+- PASS: `vulkan.bin` record ranges are the existing `serialize_pipeline` layout
+  (`u32 env count`, environments, key). No record format changed; the preparation
+  only reads captured ranges and rejects a range whose end moved.
+- PASS: `precompiled_prepared.ruzu-v<CACHE_VERSION>.txt` holds
+  `size mtime driver_version build_rev model` terminated by `\n`.
+
 ## 2026-11-19 — compute forms of the culling pass: shader_recompiler/frontend/ampere/lower_to_maxwell.rs vs Lichii shader_recompiler/frontend/ampere/lower_to_maxwell.h (4a58842d23, f356d39ba3)
 
 ### Ported (Lichii extensions; Eden has no Ampere frontend)
@@ -29358,3 +29542,125 @@ drawn black and appearing or vanishing from one frame to the next.
 
 ### Binary layout verification
 - Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/common/src/settings.rs: lock-free copies of the settings read on GPU hot paths
+
+### Intentional differences
+- Eden keeps `Settings::values` as a plain global that every thread reads without
+  synchronization. ruzu keeps it behind a `RwLock` (`values()` / `values_mut()`); every read is
+  an atomic read-modify-write of one lock word shared by all threads. Hot GPU paths read a few
+  settings per draw, per buffer lookup, per fence or per memory write (in the NX2 title used for
+  measurement, ~0.3 ms of lock traffic per frame on the split's back, `find_buffer` first).
+- `values_mut()` now returns `ValuesWriteGuard` (derefs to `Values`); its `Drop` republishes,
+  still under the write lock, lock-free copies of the effective values (`get_value`, per-game
+  overrides included): fence behavior Default / Balanced / Accurate, `barrier_feedback_loops`,
+  `skip_cpu_inner_invalidation`, `disable_buffer_reorder`, and whether `gpu_log_level` is not
+  `Off`. `VALUES.write()` is called only by
+  `values_mut()`, so no write of the global values can skip the republication; the copies are
+  also published when the global is created. Readers: `BufferCache::find_buffer` and the fence
+  download (`IsGPUFenceBehaviorAccurate` / `Balanced`), `FenceManager::signal_fence`,
+  `TextureCache::check_feedback_loop`, `RasterizerVulkan::invalidate_cached_writes`,
+  `RasterizerInterface::inner_invalidation`, `BufferCacheRuntime::can_reorder_upload`,
+  `gpu_logging::is_active` (read per draw by `GraphicsPipeline::configure_draw` and
+  `RasterizerVulkan::prepare_draw`).
+- `GPU::OnCommandListEnd` calls `Settings::UpdateGPUAccuracy()` (gpu.cpp:123-126) at the end of
+  every command list. ruzu's `update_global_gpu_accuracy` takes the write lock only when
+  `update_gpu_accuracy` would change something (the level, or one of the published GPU levels it
+  recomputes); otherwise the assignment is a no-op, as upstream.
+- Test: `every_write_of_the_global_values_republishes_the_hot_settings`.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/video_core/src/{macro,engines/maxwell_3d}.rs: `native_turing` read without the macro context's lock
+
+### Intentional differences
+- Upstream `MacroEngine::native_turing` is a plain bool that the GPU threads read without a lock
+  (`GetNativeMacroEngine().native_turing`): the pipeline lookup reads it per draw. In ruzu the
+  graphics engine lives in the shared native macro context (`ReentrantMutex<RefCell<…>>`), so the
+  split's back took that lock per draw (`PipelineCache::current_graphics_pipeline`,
+  `Maxwell3D::get_max_current_vertices`) while the split's front takes it per macro
+  (`front_run_macro`). Both threads paid a contended atomic on the same cache line: in the NX2
+  title used for measurement, 53 % of `current_graphics_pipeline`'s own time on the back, and
+  ~37 % of `front_run_macro`'s own time on the front were these lock instructions.
+- `MacroEngine::native_turing` is now private, an `Arc<AtomicBool>` read through
+  `native_turing()` (Acquire) and written through `set_native_turing()` (Release): the compiler
+  rejects any other access, so every writer goes through the setter. `Maxwell3D` keeps the flag
+  of its context's graphics engine (`native_context_turing`), taken at both places that assign
+  `native_macro_context` (`front`, `set_native_macro_context`); a context's engine is never
+  replaced. `Maxwell3D::native_turing()` reads it without the lock (or the channel's own engine
+  without a context), and replaces every `get_native_macro_engine_read(|e| e.native_turing)`;
+  that accessor is now used by tests only.
+- Acquire/Release keeps the order the lock gave between setting the mode and what was written
+  before it.
+- Test: `native_turing_is_read_from_the_engine_that_owns_the_mode`.
+
+### Binary layout verification
+- Host-only state; no serialized layout change.
+
+## 2026-11-19 — src/video_core/src/{host1x/gpu_device_memory_manager.rs,memory_manager.rs,texture_cache/{descriptor_table,texture_cache_base,texture_cache}.rs,renderer_vulkan/graphics_pipeline.rs} vs Lichii core/device_memory_manager.{h,inc}, video_core/{memory_manager.h,texture_cache/{descriptor_table.h,texture_cache_base.h,texture_cache.h},renderer_vulkan/vk_graphics_pipeline.{h,cpp}} (sampled texture memo)
+
+### Intentional differences
+- The active device memory manager is `MaxwellDeviceMemoryManager` in `host1x/`, not
+  `core/device_memory_manager.rs` (see that file's header): `translation_generation` lives there.
+  The port bumps it next to each translation cache clear of its map paths (`smmu_map`, both
+  branches of `smmu_map_internal`) and of `smmu_unmap`, where Lichii bumps it once at the end of
+  `Map` and `Unmap`.
+- `DescriptorTable::changes` starts at a per-table base 2^32 apart (Lichii: 0), so a table built
+  where a destroyed channel's was cannot repeat a count a memo recorded. Lichii's
+  `ClearReadDescriptors` also clears `bound_ids`; the port keeps the bound ids in the channel's
+  `image_view_ids` / `sampler_ids` maps, which every read of a cleared entry replaces, and
+  `invalidate_channel_image_views` still sets them to `CORRUPT_ID` at once.
+- `resolve_memoized_textures` / `memoize_textures` take `via_header_index` from the caller (Lichii
+  reads `maxwell3d->regs.sampler_binding`), as `synchronize_graphics_descriptors` takes a register
+  snapshot. The host pointers are compared with `ptr::read_unaligned` of the handle word, `TicEntry`
+  and `TscEntry` (Lichii `memcmp`); they point into the `DeviceMemory` backing, which outlives the
+  GPU, and are read only while `host_pointer_serial` is unchanged.
+- The memo prepares only views other than the null one, as the port's `visit_image_view` does
+  (Lichii's `PrepareImageView` returns for it).
+- `memoize_textures` does not keep a handle word inside the native syncpoint shim, where
+  `MemoryManager::read::<u32>` answers a syncpoint value instead of the memory the memo compares.
+- The memo is used only when the draw reads its handles through the texture cache's channel memory
+  manager (not `set_engine_with_readers`), and not while `RUZU_DEBUG_SKIP_VIEW_DRAWS` is set (the
+  port's diagnostic that watches `visit_image_view`, in place of `RecordingSampledTextures`). The
+  compute-backed mesh path (`MeshGraphicsResources::prepare`) resolves in full.
+- A constant buffer the handles come from that is not enabled leaves the draw to the full path
+  (Lichii `ASSERT`s while collecting the addresses).
+- `log_prepares` hands the previous log back instead of taking a pointer to the caller's vector.
+  `TakeTextureMemoCounts` is not ported: its only user is Lichii's draw reuse probe, which the port
+  does not have. The verify mismatch log does not print the pipeline hash.
+
+## 2026-11-20 — src/video_core/src/texture_cache/{descriptor_table,texture_cache_base,texture_cache}.rs vs Lichii video_core/texture_cache/{descriptor_table.h,texture_cache_base.h,texture_cache.h} (863730d82e, bound ids in the descriptor tables)
+
+### Ported (Lichii extension; Eden keeps `image_view_ids` / `sampler_ids` maps per channel)
+- `DescriptorTable<T, Id>::bound_ids`, sized by `refresh`, cleared with the read bits;
+  `VisitImageView` and `GetSamplerId` read and write the id there.
+- Poisoning the live image view ids with `CORRUPT_ID` when an image is deleted or rescaled is a
+  debug-build check (`#[cfg(debug_assertions)]`), as Lichii's `#ifndef NDEBUG` block.
+
+### Intentional differences
+- `Id{0}` is spelled `BoundId::ZERO` (a small trait implemented for `u32` and `SlotId`), since
+  the port's `SlotId::default()` is the invalid id, not 0.
+- The debug-only `RUZU_DEBUG_SKIP_VIEW_DRAWS` filter still keys its set by the tagged index.
+
+## 2026-11-20 — src/common/src/range_sets.rs, src/video_core/src/buffer_cache/buffer_cache.rs vs Lichii common/range_sets.inc (47a1f19d54), video_core/buffer_cache/buffer_cache.h:2255
+
+### Ported (Lichii extension; Eden backs `RangeSet` with a boost::icl interval_set)
+- `RangeSet` is a sorted vector of disjoint, non-touching `[lower, upper)` ranges searched by
+  binary search (`FirstEndingAfter`, `Add`, `Subtract`, `ForEach`, `ForEachInRange`,
+  `Intersects`). `OverlapRangeSet` is unchanged (Lichii keeps boost's split_interval_map).
+- `for_each_in_range` reports nothing for an empty or wrapping window, as Lichii; boost (and
+  the port's previous BTreeMap) reported the point inside a range for an empty window.
+- `BufferCache::is_region_gpu_modified` is `gpu_modified_ranges.intersects(addr, size)`.
+
+## 2026-11-20 — src/video_core/src/buffer_cache/buffer_cache.rs: adjacent superseding writes joined (follows the 2026-11-15 `supersede_read_downloads` divergence)
+
+### Intentional differences
+- Lichii lands the read downloads a GPU-side write overlaps (`FinishReadDownloads`), so later
+  writes find nothing pending; the port records the write instead (2026-11-15). A write that continues the last
+  recorded one (same `read_download_sequence`, starting where it ends) now extends it, instead
+  of one entry per write: on the NX2 title used for measurement ~690,000 writes a second were
+  recorded while a download was pending (constant buffer data and inline-to-memory words).
+  Keeping them as range sets per sequence was tried and cost more (`RangeSet::add` under the
+  lock). Subtractions commute:
+  the landing writes and cleans the same bytes.
